@@ -33,6 +33,7 @@
 /* Seconds between writes while the fan command is ramping. */
 #define RAMP_TICK    0.5
 
+#define MAX_FANS    8
 #define MAX_STEPS   16
 #define MAX_SENSORS 32
 
@@ -60,6 +61,7 @@ typedef struct {
     int    nsteps;
     step_t steps[MAX_STEPS];
     char   sensors[1024];   /* "auto" or comma-separated SMC keys           */
+    char   fans[64];        /* "all" or comma-separated fan indices         */
 } cfg_t;
 
 static void cfg_defaults(cfg_t *c) {
@@ -92,6 +94,7 @@ static void cfg_defaults(cfg_t *c) {
     c->mode          = MODE_AUTO;
     c->aggregate     = AGG_MEAN;
     snprintf(c->sensors, sizeof(c->sensors), "auto");
+    snprintf(c->fans, sizeof(c->fans), "all");
 
     static const step_t d[] = {
         {  0, 1000 }, { 58, 1400 }, { 65, 1800 }, { 71, 2300 },
@@ -188,22 +191,68 @@ static bool skey_writable(const skey_t *k) {
 }
 
 typedef struct {
-    skey_t actual;   /* F0Ac - measured RPM     */
-    skey_t target;   /* F0Tg - requested RPM    */
-    skey_t mode;     /* F0Md - 0 auto, 1 forced */
-    skey_t fmin;     /* F0Mn - minimum RPM      */
-    skey_t fmax;     /* F0Mx - maximum RPM      */
+    int    idx;      /* the N in F<N>Ac         */
+    skey_t actual;   /* F<N>Ac - measured RPM   */
+    skey_t target;   /* F<N>Tg - requested RPM  */
+    skey_t mode;     /* F<N>Md - 0 auto, 1 forced */
+    skey_t fmin;     /* F<N>Mn - minimum RPM    */
+    skey_t fmax;     /* F<N>Mx - maximum RPM    */
     bool   has_mode, has_fmin;
+    double hw_max;   /* F<N>Mx as read at startup, 0 if implausible */
 } fan_t;
 
-static bool fan_init(fan_t *f) {
+static bool fan_init(fan_t *f, int idx) {
+    char k[5];
     memset(f, 0, sizeof(*f));
-    if (!skey_init(&f->actual, "F0Ac")) return false;
-    if (!skey_init(&f->target, "F0Tg")) return false;
-    if (!skey_init(&f->fmax,   "F0Mx")) return false;
-    f->has_mode = skey_init(&f->mode, "F0Md");
-    f->has_fmin = skey_init(&f->fmin, "F0Mn");
+    f->idx = idx;
+    snprintf(k, sizeof k, "F%dAc", idx); if (!skey_init(&f->actual, k)) return false;
+    snprintf(k, sizeof k, "F%dTg", idx); if (!skey_init(&f->target, k)) return false;
+    snprintf(k, sizeof k, "F%dMx", idx); if (!skey_init(&f->fmax,   k)) return false;
+    snprintf(k, sizeof k, "F%dMd", idx); f->has_mode = skey_init(&f->mode, k);
+    snprintf(k, sizeof k, "F%dMn", idx); f->has_fmin = skey_init(&f->fmin, k);
+    if (!skey_read(&f->fmax, &f->hw_max) || f->hw_max < 100 || f->hw_max > 20000)
+        f->hw_max = 0;
     return true;
+}
+
+/* Every fan the machine has, or the subset the config asked for. Machines with
+ * two fans (14"/16" MacBook Pro, some iMacs) were previously left with only
+ * fan 0 managed and the rest on the SMC's own thermostat. */
+typedef struct {
+    fan_t f[MAX_FANS];
+    int   n;
+} fanset_t;
+
+static unsigned fans_mask(const char *want) {
+    if (!*want || strcmp(want, "all") == 0) return ~0u;
+    unsigned m = 0;
+    char buf[64];
+    snprintf(buf, sizeof buf, "%s", want);
+    for (char *tok = strtok(buf, ", \t"); tok; tok = strtok(NULL, ", \t")) {
+        int i = atoi(tok);
+        if (i >= 0 && i < MAX_FANS) m |= 1u << i;
+    }
+    return m ? m : ~0u;
+}
+
+/* FNum is the SMC's own fan count. Where it is missing we probe instead and let
+ * fan_init reject the indices that do not exist. */
+static bool fanset_init(fanset_t *fs, const char *want) {
+    skey_t nk;
+    double nv = 0;
+    int count = MAX_FANS;
+    unsigned mask = fans_mask(want);
+
+    fs->n = 0;
+    if (skey_init(&nk, "FNum") && skey_read(&nk, &nv) && nv >= 1 && nv <= MAX_FANS)
+        count = (int)nv;
+
+    for (int i = 0; i < count && fs->n < MAX_FANS; i++) {
+        if (!(mask & (1u << i))) continue;
+        fan_t f;
+        if (fan_init(&f, i)) fs->f[fs->n++] = f;
+    }
+    return fs->n > 0;
 }
 
 /* ------------------------------------------------------------- sensor set */
@@ -263,7 +312,7 @@ static void probe_family(const char *prefix, const char *mids, int keep) {
 static void sensors_auto(void) {
     probe_family("Tp", "0123", 10);   /* Apple Silicon CPU core clusters */
     probe_family("Tg", "01",    6);   /* Apple Silicon GPU dies          */
-    sensor_add("Tm0p"); sensor_add("Tm1p");   /* memory                  */
+    probe_family("Tm", "0123", 4);    /* memory - how many varies by config */
     /* Deliberately not TCMz: it is the die maximum, i.e. exactly max(Tp**),
      * so as a one-member family it would win every cross-family max and
      * cancel out the averaging AGG_MEAN exists to do. */
@@ -397,6 +446,7 @@ static bool cfg_load(cfg_t *c, const char *path, bool quiet) {
         else if (!strcmp(k, "min_rpm"))        c->min_rpm = atof(v);
         else if (!strcmp(k, "max_rpm"))        c->max_rpm = atof(v);
         else if (!strcmp(k, "critical_temp"))  c->critical_temp = atof(v);
+        else if (!strcmp(k, "fans"))          snprintf(c->fans, sizeof(c->fans), "%s", v);
         else if (!strcmp(k, "sensors"))        snprintf(c->sensors, sizeof(c->sensors), "%s", v);
         else if (!strcmp(k, "mode"))
             c->mode = !strcmp(v, "force") ? MODE_FORCE :
@@ -447,13 +497,13 @@ static int resolve_mode(const fan_t *f, int mode, bool verbose) {
     bool floor_ok = f->has_fmin && skey_writable(&f->fmin);
     if (mode == MODE_AUTO) {
         if (verbose)
-            logf_("mode auto -> %s (F0Mn is %s)", floor_ok ? "floor" : "force",
+            logf_("mode auto -> %s (F%dMn is %s)", floor_ok ? "floor" : "force", f->idx,
                   !f->has_fmin ? "missing" : floor_ok ? "writable" : "read-only");
         return floor_ok ? MODE_FLOOR : MODE_FORCE;
     }
     if (mode == MODE_FLOOR && !floor_ok) {
         if (verbose)
-            logf_("warn: F0Mn is %s here, falling back to force mode",
+            logf_("warn: F%dMn is %s here, falling back to force mode", f->idx,
                   f->has_fmin ? "read-only" : "missing");
         return MODE_FORCE;
     }
@@ -507,11 +557,33 @@ static bool fan_apply(const fan_t *f, const cfg_t *c, double rpm, bool *wrote) {
     return ok;
 }
 
+/* One curve, applied to every managed fan, each clamped to its own ceiling:
+ * a smaller fan must not be asked for RPM it cannot reach, and a larger one
+ * should not be held back by a smaller sibling. */
+static bool fanset_apply(const fanset_t *fs, const cfg_t *c, double rpm, bool *wrote) {
+    bool ok = true;
+    *wrote = false;
+    for (int i = 0; i < fs->n; i++) {
+        bool w = false;
+        double r = rpm;
+        if (fs->f[i].hw_max > 100) r = clampd(r, c->min_rpm, fs->f[i].hw_max);
+        ok &= fan_apply(&fs->f[i], c, r, &w);
+        *wrote |= w;
+    }
+    return ok;
+}
+
 static bool fan_release(const fan_t *f, const cfg_t *c) {
     bool ok = true;
     if (f->has_fmin && skey_writable(&f->fmin))
         ok &= skey_write_confirm(&f->fmin, c->min_rpm, 2.0);
     if (f->has_mode) ok &= skey_write_confirm(&f->mode, 0, 2.0);
+    return ok;
+}
+
+static bool fanset_release(const fanset_t *fs, const cfg_t *c) {
+    bool ok = true;
+    for (int i = 0; i < fs->n; i++) ok &= fan_release(&fs->f[i], c);
     return ok;
 }
 
@@ -547,18 +619,26 @@ static int run_daemon(const char *conf) {
 
     if (smc_open() != 0) { logf_("error: cannot open AppleSMC"); return 1; }
 
-    fan_t fan;
-    if (!fan_init(&fan)) { logf_("error: no fan keys (F0Ac/F0Tg/F0Mx)"); return 1; }
-    cfg.mode = resolve_mode(&fan, cfg.mode, true);
+    fanset_t fans;
+    if (!fanset_init(&fans, cfg.fans)) {
+        logf_("error: no fan keys (F0Ac/F0Tg/F0Mx)");
+        return 1;
+    }
+    /* One mode for the set. In practice sibling fans on a machine expose the
+     * same writability, and resolving per fan would allow a split that the rest
+     * of the loop has no way to represent. */
+    cfg.mode = resolve_mode(&fans.f[0], cfg.mode, true);
 
-    double hw_max;
-    if (skey_read(&fan.fmax, &hw_max) && hw_max > 100 && hw_max < 20000)
-        cfg.max_rpm = fmin(cfg.max_rpm, hw_max);
+    /* Ceiling is the most capable fan's; each is clamped to its own on write. */
+    double hw_max = 0;
+    for (int i = 0; i < fans.n; i++) hw_max = fmax(hw_max, fans.f[i].hw_max);
+    if (hw_max > 100) cfg.max_rpm = fmin(cfg.max_rpm, hw_max);
 
     sensors_setup(&cfg);
     if (g_nsensors == 0) { logf_("error: no usable temperature sensors"); return 1; }
 
-    logf_("fanctl %s starting (max_rpm=%.0f)", VERSION, cfg.max_rpm);
+    logf_("fanctl %s starting (%d fan%s, max_rpm=%.0f)", VERSION,
+          fans.n, fans.n == 1 ? "" : "s", cfg.max_rpm);
     describe_setup(&cfg);
 
     signal(SIGTERM, on_signal);
@@ -586,7 +666,7 @@ static int run_daemon(const char *conf) {
             cfg_t nc;
             cfg_defaults(&nc);
             cfg_load(&nc, conf, true);
-            nc.mode = resolve_mode(&fan, nc.mode, false);
+            nc.mode = resolve_mode(&fans.f[0], nc.mode, false);
             nc.max_rpm = fmin(nc.max_rpm, cfg.max_rpm);
             bool resensor = strcmp(nc.sensors, cfg.sensors) != 0;
             cfg = nc;
@@ -604,7 +684,7 @@ static int run_daemon(const char *conf) {
         if (paused != was_paused) {
             was_paused = paused;
             logf_("%s", paused ? "paused - fan returned to SMC control" : "resumed");
-            if (paused && !g_dry) fan_release(&fan, &cfg);
+            if (paused && !g_dry) fanset_release(&fans, &cfg);
             applied = -1; rpm = -1; ewma = -1;
             level = 0; pending_dir = 0; logged_level = -1;
         }
@@ -615,7 +695,7 @@ static int run_daemon(const char *conf) {
         if (!sensors_sample(cfg.aggregate, &temp, &peak, &hot)) {
             if (++fail_streak == 3) {
                 logf_("error: sensors unreadable, returning fan to SMC control");
-                fan_release(&fan, &cfg);
+                fanset_release(&fans, &cfg);
                 applied = -1;
             }
             sleep_sec(cfg.poll);
@@ -666,7 +746,7 @@ static int run_daemon(const char *conf) {
         }
 
         bool wrote = false;
-        if (!g_dry && !fan_apply(&fan, &cfg, rpm, &wrote)) {
+        if (!g_dry && !fanset_apply(&fans, &cfg, rpm, &wrote)) {
             if (write_fails++ % 100 == 0)
                 logf_("error: SMC write failed (running as root?) [%d]", write_fails);
         } else if (wrote || rpm != applied) {
@@ -699,7 +779,7 @@ static int run_daemon(const char *conf) {
     }
 
     logf_("stopping, returning fan to SMC control");
-    if (!g_dry && !fan_release(&fan, &cfg))
+    if (!g_dry && !fanset_release(&fans, &cfg))
         logf_("warn: could not restore SMC control");
     smc_close();
     return 0;
@@ -738,19 +818,22 @@ static int cmd_status(const char *conf) {
     cfg_load(&cfg, conf, true);
     if (smc_open() != 0) { fprintf(stderr, "cannot open AppleSMC\n"); return 1; }
 
-    fan_t fan;
-    if (!fan_init(&fan)) { fprintf(stderr, "no fan keys found\n"); return 1; }
+    fanset_t fans;
+    if (!fanset_init(&fans, cfg.fans)) { fprintf(stderr, "no fan keys found\n"); return 1; }
     sensors_setup(&cfg);
-    cfg.mode = resolve_mode(&fan, cfg.mode, false);
+    cfg.mode = resolve_mode(&fans.f[0], cfg.mode, false);
 
     double temp = 0, peak = 0, ac = 0, tg = 0, md = 0, mn = 0, mx = 0;
     const char *hot = NULL;
     bool have_t = sensors_sample(cfg.aggregate, &temp, &peak, &hot);
-    skey_read(&fan.actual, &ac);
-    skey_read(&fan.target, &tg);
-    skey_read(&fan.fmax, &mx);
-    if (fan.has_fmin) skey_read(&fan.fmin, &mn);
-    if (fan.has_mode) skey_read(&fan.mode, &md);
+    /* Fan 0 drives the headline figures; the rest are listed only when they
+     * exist, so a single-fan machine sees exactly what it always did. */
+    const fan_t *f0 = &fans.f[0];
+    skey_read(&f0->actual, &ac);
+    skey_read(&f0->target, &tg);
+    skey_read(&f0->fmax, &mx);
+    if (f0->has_fmin) skey_read(&f0->fmin, &mn);
+    if (f0->has_mode) skey_read(&f0->mode, &md);
 
     if (have_t) {
         printf("temp      %.1f C control (%s of %d sensors), %.1f C peak @%s\n",
@@ -759,8 +842,20 @@ static int cmd_status(const char *conf) {
     } else {
         printf("temp      n/a  (%d sensors, all unreadable)\n", g_nsensors);
     }
-    printf("fan       %.0f rpm actual, %.0f rpm target\n", ac, tg);
-    printf("limits    min %.0f / max %.0f rpm\n", mn, mx);
+    if (fans.n == 1) {
+        printf("fan       %.0f rpm actual, %.0f rpm target\n", ac, tg);
+        printf("limits    min %.0f / max %.0f rpm\n", mn, mx);
+    } else {
+        printf("fans      %d managed\n", fans.n);
+        for (int i = 0; i < fans.n; i++) {
+            double a = 0, t = 0;
+            skey_read(&fans.f[i].actual, &a);
+            skey_read(&fans.f[i].target, &t);
+            printf("  F%d      %.0f rpm actual, %.0f rpm target, max %.0f\n",
+                   fans.f[i].idx, a, t, fans.f[i].hw_max);
+        }
+        printf("limits    min %.0f rpm\n", mn);
+    }
     printf("smc mode  %s\n", md != 0
            ? "forced (F0Md=1) - fan pinned at target"
            : "auto (F0Md=0) - SMC's own thermostat");
@@ -801,22 +896,25 @@ static int status_json(const char *conf) {
         printf("{\"ok\":false,\"error\":\"cannot open AppleSMC\"}\n");
         return 1;
     }
-    fan_t fan;
-    if (!fan_init(&fan)) {
+    fanset_t fans;
+    if (!fanset_init(&fans, cfg.fans)) {
         printf("{\"ok\":false,\"error\":\"no fan keys found\"}\n");
         return 1;
     }
     sensors_setup(&cfg);
-    cfg.mode = resolve_mode(&fan, cfg.mode, false);
+    cfg.mode = resolve_mode(&fans.f[0], cfg.mode, false);
 
     double temp = 0, peak = 0, ac = 0, tg = 0, md = 0, mn = 0, mx = 0;
     const char *hot = NULL;
     bool have_t = sensors_sample(cfg.aggregate, &temp, &peak, &hot);
-    skey_read(&fan.actual, &ac);
-    skey_read(&fan.target, &tg);
-    skey_read(&fan.fmax, &mx);
-    if (fan.has_fmin) skey_read(&fan.fmin, &mn);
-    if (fan.has_mode) skey_read(&fan.mode, &md);
+    /* Fan 0 drives the headline figures; the rest are listed only when they
+     * exist, so a single-fan machine sees exactly what it always did. */
+    const fan_t *f0 = &fans.f[0];
+    skey_read(&f0->actual, &ac);
+    skey_read(&f0->target, &tg);
+    skey_read(&f0->fmax, &mx);
+    if (f0->has_fmin) skey_read(&f0->fmin, &mn);
+    if (f0->has_mode) skey_read(&f0->mode, &md);
 
     int lvl = 0;
     if (md != 0) {
@@ -835,6 +933,16 @@ static int status_json(const char *conf) {
            temp, peak, hot ? hot : "");
     printf(",\"nsensors\":%d", g_nsensors);
     printf(",\"rpm\":%.0f,\"target\":%.0f", ac, tg);
+    printf(",\"nfans\":%d", fans.n);
+    printf(",\"fans\":[");
+    for (int i = 0; i < fans.n; i++) {
+        double a = 0, t = 0;
+        skey_read(&fans.f[i].actual, &a);
+        skey_read(&fans.f[i].target, &t);
+        printf("%s{\"idx\":%d,\"rpm\":%.0f,\"target\":%.0f,\"max\":%.0f}",
+               i ? "," : "", fans.f[i].idx, a, t, fans.f[i].hw_max);
+    }
+    printf("]");
     printf(",\"min_rpm\":%.0f,\"max_rpm\":%.0f", mn, mx);
     printf(",\"forced\":%s", md != 0 ? "true" : "false");
     printf(",\"mode\":\"%s\"", cfg.mode == MODE_FORCE ? "force" : "floor");
@@ -870,31 +978,31 @@ static int cmd_temps(const char *conf) {
 
 static int cmd_set(double rpm, int mode) {
     if (smc_open() != 0) { fprintf(stderr, "cannot open AppleSMC\n"); return 1; }
-    fan_t fan;
-    if (!fan_init(&fan)) { fprintf(stderr, "no fan keys found\n"); return 1; }
+    fanset_t fans;
+    if (!fanset_init(&fans, "all")) { fprintf(stderr, "no fan keys found\n"); return 1; }
     cfg_t cfg;
     cfg_defaults(&cfg);
     cfg.mode = mode;
-    double mx;
-    if (skey_read(&fan.fmax, &mx) && mx > 100) rpm = clampd(rpm, 0, mx);
     bool wrote;
-    if (!fan_apply(&fan, &cfg, rpm, &wrote)) {
+    /* fanset_apply clamps each fan to its own ceiling, so no clamp here. */
+    if (!fanset_apply(&fans, &cfg, rpm, &wrote)) {
         fprintf(stderr, "SMC write failed - run as root\n");
         smc_close();
         return 1;
     }
-    printf("%s -> %.0f rpm\n", mode == MODE_FORCE ? "F0Tg" : "F0Mn", rpm);
+    printf("%s -> %.0f rpm on %d fan%s\n", mode == MODE_FORCE ? "target" : "floor",
+           rpm, fans.n, fans.n == 1 ? "" : "s");
     smc_close();
     return 0;
 }
 
 static int cmd_auto(void) {
     if (smc_open() != 0) { fprintf(stderr, "cannot open AppleSMC\n"); return 1; }
-    fan_t fan;
-    if (!fan_init(&fan)) { fprintf(stderr, "no fan keys found\n"); return 1; }
+    fanset_t fans;
+    if (!fanset_init(&fans, "all")) { fprintf(stderr, "no fan keys found\n"); return 1; }
     cfg_t cfg;
     cfg_defaults(&cfg);
-    bool ok = fan_release(&fan, &cfg);
+    bool ok = fanset_release(&fans, &cfg);
     smc_close();
     if (!ok) {
         fprintf(stderr, "SMC write failed - run as root\n");
@@ -996,8 +1104,10 @@ static probe_r probe_mode(const fan_t *f, int mode, double want,
 
 static int cmd_selftest(void) {
     if (smc_open() != 0) { fprintf(stderr, "FAIL: cannot open AppleSMC\n"); return 1; }
+    /* Fan 0 only: this establishes which control method the SMC honours, which
+     * is a property of the machine, not of an individual fan. */
     fan_t fan;
-    if (!fan_init(&fan)) { fprintf(stderr, "FAIL: fan keys missing\n"); return 1; }
+    if (!fan_init(&fan, 0)) { fprintf(stderr, "FAIL: fan keys missing\n"); return 1; }
 
     printf("euid          %d%s\n", (int)geteuid(),
            geteuid() == 0 ? "" : "  <- not root, writes will fail");
