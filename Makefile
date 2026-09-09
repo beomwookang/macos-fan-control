@@ -36,6 +36,16 @@ $(APP): $(SWIFT) app/Info.plist app/Fanctl.icns
 
 app: $(APP)
 
+# Logic checks for the app: the config rewriter and the curve editor's editing
+# rules, driven through the real event handlers.
+test: build/tests
+	./build/tests
+
+build/tests: tests/EditorTests.swift app/Core.swift app/StatusArt.swift app/CurveEditor.swift
+	@mkdir -p build
+	swiftc -o $@ tests/EditorTests.swift app/Core.swift app/StatusArt.swift app/CurveEditor.swift
+
+
 clean:
 	rm -rf build
 
@@ -45,4 +55,4 @@ install: $(BIN)
 uninstall:
 	./uninstall.sh
 
-.PHONY: all app clean install uninstall
+.PHONY: all app test clean install uninstall

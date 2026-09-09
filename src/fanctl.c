@@ -26,7 +26,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define VERSION "1.2.0"
+#define VERSION "1.3.0"
 #define DEFAULT_CONF "/usr/local/etc/fanctl.conf"
 #define RUN_DIR      "/usr/local/var/run"
 #define PAUSE_FILE   RUN_DIR "/fanctl.paused"

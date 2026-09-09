@@ -30,6 +30,12 @@ jobs:
           ./build/fanctl --help > /dev/null
           codesign -v build/Fanctl.app
 
+      # Logic only: the config rewriter and the curve editor's editing rules,
+      # driven through the real event handlers. No window is created, so this
+      # runs on a headless runner.
+      - name: Test
+        run: make test
+
       - name: Check scripts
         run: |
           bash -n install.sh
