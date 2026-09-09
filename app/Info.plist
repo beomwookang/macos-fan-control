@@ -6,6 +6,7 @@
 	<key>CFBundleDisplayName</key><string>Fanctl</string>
 	<key>CFBundleIdentifier</key><string>com.local.fanctl.menubar</string>
 	<key>CFBundleExecutable</key><string>Fanctl</string>
+	<key>CFBundleIconFile</key><string>Fanctl</string>
 	<key>CFBundlePackageType</key><string>APPL</string>
 	<key>CFBundleVersion</key><string>1.1.0</string>
 	<key>CFBundleShortVersionString</key><string>1.1.0</string>

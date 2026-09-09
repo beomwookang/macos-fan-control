@@ -3,6 +3,9 @@
 # and macOS refuses to launch it.
 build/
 
+# Intermediate of Fanctl.icns; iconutil input, not a source
+app/Fanctl.iconset/
+
 # Local backups
 *.bak
 src.bak-*/

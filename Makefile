@@ -21,7 +21,7 @@ $(BIN): $(SRC) src/smc.h
 # SMAppService precisely so no Developer ID is needed.
 SWIFT = app/main.swift app/CurveEditor.swift
 
-$(APP): $(SWIFT) app/Info.plist
+$(APP): $(SWIFT) app/Info.plist app/Fanctl.icns
 	@rm -rf $(APP)
 	@mkdir -p $(APP)/Contents/MacOS
 	swiftc -O -target arm64-apple-macos13.0   -o build/.Fanctl-arm64  $(SWIFT)
@@ -29,6 +29,8 @@ $(APP): $(SWIFT) app/Info.plist
 	lipo -create -output $(APP)/Contents/MacOS/Fanctl build/.Fanctl-arm64 build/.Fanctl-x86_64
 	@rm -f build/.Fanctl-arm64 build/.Fanctl-x86_64
 	cp app/Info.plist $(APP)/Contents/Info.plist
+	@mkdir -p $(APP)/Contents/Resources
+	cp app/Fanctl.icns $(APP)/Contents/Resources/Fanctl.icns
 	codesign --force --sign - $(APP)
 	@echo "built $(APP)"
 
