@@ -1,0 +1,69 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: make
+
+      # GitHub's macOS runners are VMs with no AppleSMC, so anything that reads
+      # a sensor cannot run here. What is checkable is that both binaries build
+      # universal, are signed, and that the paths not touching the SMC work.
+      - name: Check binaries
+        run: |
+          test -x build/fanctl
+          test -d build/Fanctl.app/Contents/MacOS
+          for b in build/fanctl build/Fanctl.app/Contents/MacOS/Fanctl; do
+            lipo -info "$b"
+            lipo -info "$b" | grep -q arm64
+            lipo -info "$b" | grep -q x86_64
+          done
+          ./build/fanctl --version
+          ./build/fanctl --help > /dev/null
+          codesign -v build/Fanctl.app
+
+      - name: Check scripts
+        run: |
+          bash -n install.sh
+          bash -n uninstall.sh
+          bash -n diag.sh
+          zsh -n fanctl-admin
+
+      # The installer rewrites this file with sed and awk, so its shape matters
+      # as much as its values.
+      - name: Check the shipped config
+        run: |
+          grep -qE '^[[:space:]]*mode[[:space:]]*=' fanctl.conf
+          grep -qE '^[[:space:]]*curve[[:space:]]*=' fanctl.conf
+
+      # BSD grep has no -P, so this is done in Python rather than with a
+      # \p{Hangul} pattern that only works on the GNU build.
+      - name: Check for untranslated text
+        run: |
+          python3 - <<'PY'
+          import re, subprocess, sys
+          files = subprocess.check_output(
+              ["git", "ls-files", ":!assets/*"], text=True).split()
+          bad = []
+          for f in files:
+              try:
+                  text = open(f, encoding="utf-8").read()
+              except (UnicodeDecodeError, IsADirectoryError, FileNotFoundError):
+                  continue
+              for i, line in enumerate(text.split("\n"), 1):
+                  if re.search(r"[가-힣]", line):
+                      bad.append("%s:%d: %s" % (f, i, line.strip()))
+          if bad:
+              print("Untranslated text:")
+              print("\n".join(bad))
+              sys.exit(1)
+          print("%d files checked, all English" % len(files))
+          PY

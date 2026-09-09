@@ -4,6 +4,7 @@
 
 **A temperature-driven fan controller for macOS: a tiny C daemon that follows a fan curve you define, plus a menu bar app so it is never running invisibly.** Built for Apple Silicon (developed on an M4 Mac mini) and works on Intel Macs too.
 
+[![build](https://github.com/beomwookang/macos-fan-control/actions/workflows/build.yml/badge.svg)](https://github.com/beomwookang/macos-fan-control/actions/workflows/build.yml)
 [![Platform](https://img.shields.io/badge/platform-macOS%2013%2B-lightgrey)](#requirements)
 [![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-native-black)](#requirements)
 [![Language](https://img.shields.io/badge/C-IOKit%20only-blue)](src/)
@@ -38,7 +39,7 @@ No network access, no telemetry, no auto-updater, no external dependencies. Two 
 | | |
 | --- | --- |
 | macOS | 13 (Ventura) or newer |
-| Hardware | Apple Silicon or Intel Mac with **one fan** ([see below](#macs-with-more-than-one-fan)) |
+| Hardware | Apple Silicon or Intel Mac. Every fan the machine reports is managed |
 | To build | Xcode Command Line Tools — `xcode-select --install` |
 
 ## Install
@@ -80,6 +81,8 @@ sudo fanctl pause      # hand the fan back to macOS, leave the daemon running
 sudo fanctl resume
 
 fanctl -n -v daemon    # dry run: decide and log, never touch the fan. Use this to tune.
+
+sudo fanctl calibrate  # measure this machine and suggest a curve (~6 min, loud)
 ```
 
 `fanctl status` looks like this:
@@ -102,7 +105,7 @@ Open `Fanctl.app` and a fan icon appears in the menu bar. It stays there while t
 | Temperature / RPM / step | Refreshes every 3 s, including while the menu is open |
 | Fan control on / off | `fanctl pause` / `resume`. Off means macOS takes over. |
 | Presets | Quiet / Balanced / Cool |
-| Settings… | Edit the curve and every response parameter, each with a note on what it trades |
+| Settings… | A draggable curve graph with a live marker. The nine response parameters sit behind an Advanced disclosure, each with a note on what it trades |
 | Start at login | Toggles a `LaunchAgent` in `~/Library/LaunchAgents` |
 | Start daemon at boot | `launchctl enable` / `disable` |
 | Quit | **Stops the daemon too, and hands the fan back to macOS** |
@@ -112,6 +115,46 @@ The app has no privilege of its own. Everything needing root goes through `/usr/
 Saving settings rewrites **only the lines whose values changed**, so the commentary in your config file survives. The new config is parsed with `fanctl -c <tmpfile> status` before it is installed, so a curve the daemon would reject never reaches the live file.
 
 ## Tuning the fan curve
+
+The easiest way is to drag it: **Settings…** in the menu bar opens a graph with
+a draggable point per curve step, and a live marker showing where the machine
+currently sits on it.
+
+If you would rather not guess at the numbers at all, measure them:
+
+```sh
+sudo fanctl calibrate        # cap the die at 80 C (the default)
+sudo fanctl calibrate 75     # or wherever you want it capped
+```
+
+This runs an all-core load and holds the fan at a series of fixed speeds,
+recording where the temperature actually settles at each. It takes about six
+minutes, the machine is hot and loud throughout, and it pauses the daemon while
+it works. What comes back is what each temperature actually costs on *your*
+machine, plus a curve line ready to paste:
+
+```
+Equilibrium under full load:
+   1000 rpm  ->  89.4 C
+   1975 rpm  ->  79.1 C
+   2950 rpm  ->  72.6 C
+   3925 rpm  ->  68.2 C
+   4900 rpm  ->  65.9 C
+
+RPM needed to hold a given temperature:
+   85 C   1443 rpm
+   80 C   1889 rpm
+   75 C   2610 rpm
+   70 C   3550 rpm
+```
+
+Why it reports it that way round: the measured locus *falls* as RPM rises,
+while a fan curve *rises* with temperature, so the two cross exactly once — and
+that crossing is where the machine will really sit. The useful question is
+therefore not what the curve should look like, but what RPM holds the
+temperature you asked for.
+
+### Editing it by hand
 
 The `curve` line in `/usr/local/etc/fanctl.conf` is the whole story — `temperature:RPM` pairs in ascending order:
 
@@ -210,13 +253,19 @@ What a fan can actually change is the bulk die and heatsink temperature, and tha
 
 ## Macs with more than one fan
 
-**Only the first fan is controlled.** Every key used here — `F0Ac`, `F0Tg`, `F0Md`, `F0Mn` — belongs to fan 0. `F1*` and `F2*` are untouched. That covers 14"/16" MacBook Pros, some iMacs, and the Mac Pro: the remaining fans stay on macOS automatic control, so nothing is unsafe, but you will not get as quiet as you hoped.
+All of them are managed. The fan count comes from `FNum`, the SMC's own, with
+probing as a fallback where it is missing — so 14"/16" MacBook Pros, iMacs and
+the Mac Pro get every fan driven rather than just the first.
 
-Check how many fans you have:
+One curve applies to the whole set, with each fan clamped to its own `F<N>Mx`:
+a smaller fan should not be asked for RPM it cannot reach, and a larger one
+should not be held back by a smaller sibling. `fanctl status` lists them
+individually once there is more than one.
 
-```sh
-fanctl dump F0    # fan 0 keys
-fanctl dump F1    # any output here means two or more fans
+To manage only some of them, list the indices in the config:
+
+```
+fans = 0,1
 ```
 
 ## fanctl vs other macOS fan control tools
@@ -225,12 +274,18 @@ fanctl dump F1    # any output here means two or more fans
 | --- | --- | --- | --- | --- |
 | Temperature-driven curve | Multi-step with hysteresis and dwell | Two-point sensor ramp | Minimum RPM only | Yes |
 | Anti-spike rate limiting | Yes, configurable | No | No | No |
+| Graphical curve editor | Yes | No | No | No |
+| Measures your machine to suggest a curve | `fanctl calibrate` | No | No | No |
+| Controls every fan | Yes | Yes | First only | Yes |
 | Menu bar UI | Yes | Yes | Yes | Yes |
 | Survives an unclean exit safely | Falls back to SMC control | Leaves RPM latched | — | — |
 | Cost | Free, MIT | Free / paid tiers | Free | Paid |
 | Source available | Yes | No | Yes | No |
 
-Not a like-for-like comparison — the commercial tools do far more (per-sensor dashboards, battery diagnostics, multi-fan control). This one does a curve, quietly, and gets out of the way.
+Not a like-for-like comparison — the commercial tools do far more (per-sensor
+dashboards covering every SMC key, external drive SMART temperatures, battery
+diagnostics, Fahrenheit, named custom presets). This one does a curve, quietly,
+and gets out of the way.
 
 ## FAQ
 
@@ -255,6 +310,12 @@ It should. Both binaries are universal (arm64 + x86_64) and sensors and fan keys
 ### Why does it need a `sudoers` rule?
 
 Fan control requires root, and prompting for a password on every menu bar click is unusable. The rule permits exactly one script — `/usr/local/libexec/fanctl-admin` — which runs a fixed set of verbs and never passes caller input to a shell. Everything the rule allows is listed in [What it touches](#what-it-touches-on-your-system). `uninstall.sh` removes it.
+
+### The shipped curve is wrong for my machine. Now what?
+
+It probably is — those RPM numbers were measured on an M4 mini. Run
+`sudo fanctl calibrate` and it will tell you what your machine actually costs
+at each temperature, then hand you a curve to match.
 
 ### Will this drain my MacBook battery?
 
