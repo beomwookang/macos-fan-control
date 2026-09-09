@@ -100,10 +100,26 @@ curve     0C:1000 58C:1400* 65C:1800 71C:2300 77C:2900 83C:3600 89C:4300 95C:490
 
 Open `Fanctl.app` and a fan icon appears in the menu bar. It stays there while the daemon runs, and **if the icon is gone, fan control is off.** A tool quietly pinning your fan is the problem this project exists to solve, so that correspondence has to hold.
 
-| Menu item | What it does |
+### In the bar
+
+A drawn mark, then temperature over RPM on two short lines in monospaced digits,
+so the item stays narrow and does not shuffle sideways as the numbers change.
+
+Both halves of the mark carry a value rather than decorating: the fan's ring
+fills clockwise with RPM and its blades advance further between refreshes the
+faster it turns, while the thermometer's column rises and reddens with
+temperature. The whole mark dims when control is off. A glance answers the same
+question as reading the numbers, for the times you are not reading them.
+
+The temperature colour has two steps, both derived from the config's own
+`critical_temp` rather than from hardcoded numbers — orange 20 °C below it, red
+8 °C below it — so they follow if you change that setting.
+
+### In the menu
+
+| Item | What it does |
 | --- | --- |
-| Temperature and RPM in the bar itself | Both, always, in monospaced digits so the item does not jitter as the numbers change. The temperature is coloured: normal, orange from 20 °C below `critical_temp`, red from 8 °C below it — so the thresholds move if you change that setting |
-| Dropdown detail | Peak temperature and which sensor it came from, the curve step, and the target RPM while a ramp is in progress. Refreshes every 3 s, including while the menu is open |
+| Status panel | The current reading, the peak and which sensor it came from, a temperature sparkline over the last few minutes, and a bar showing how much of the fan's range is in use — with a tick at the RPM the curve is asking for while a ramp is still climbing to it. Refreshes every 3 s, including while the menu is open |
 | Fan control on / off | `fanctl pause` / `resume`. Off means macOS takes over. |
 | Presets | Quiet / Balanced / Cool |
 | Settings… | A draggable curve graph with a live marker. The nine response parameters sit behind an Advanced disclosure, each with a note on what it trades |

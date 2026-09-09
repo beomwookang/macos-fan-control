@@ -19,7 +19,7 @@ $(BIN): $(SRC) src/smc.h
 # whole project stays `make && sudo ./install.sh`. Ad-hoc signed: it is only
 # ever installed locally, and the login item is a LaunchAgent rather than
 # SMAppService precisely so no Developer ID is needed.
-SWIFT = app/Core.swift app/CurveEditor.swift app/Settings.swift app/main.swift
+SWIFT = app/Core.swift app/StatusArt.swift app/CurveEditor.swift app/Settings.swift app/main.swift
 
 $(APP): $(SWIFT) app/Info.plist app/Fanctl.icns
 	@rm -rf $(APP)
