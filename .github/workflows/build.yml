@@ -59,7 +59,9 @@ jobs:
               except (UnicodeDecodeError, IsADirectoryError, FileNotFoundError):
                   continue
               for i, line in enumerate(text.split("\n"), 1):
-                  if re.search(r"[가-힣]", line):
+                  # Escaped, not literal: a literal range would make this
+                  # file the first thing the check reports.
+                  if re.search("[\\uac00-\\ud7a3]", line):
                       bad.append("%s:%d: %s" % (f, i, line.strip()))
           if bad:
               print("Untranslated text:")
