@@ -344,6 +344,24 @@ Running the daemon costs about 0.017 % CPU, which is negligible. Running the *fa
 
 Pick the Quiet preset in the menu bar, or raise the curve thresholds so each RPM step arrives later. Lowering `slew_up` makes the changes themselves less noticeable without changing the temperatures you settle at.
 
+## Working on it
+
+```sh
+make            # the daemon and the app
+make test       # the app's logic checks
+make app        # just the app, when only Swift changed
+```
+
+`make test` covers the curve editor's editing rules and the config rewriter,
+driven through the real event handlers rather than by calling into the model —
+the rules exist to stop a drag producing a curve the daemon accepts and then
+behaves oddly on, so testing below the event layer would not test them. It
+creates no window and runs on a headless machine.
+
+Not covered, and worth knowing before trusting either: `fanctl calibrate` has
+no automated test beyond its interpolation, and the multi-fan path has only
+ever run on a machine with one fan.
+
 ## Uninstall
 
 ```sh
