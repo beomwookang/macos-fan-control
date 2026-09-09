@@ -15,6 +15,7 @@
 
 #include <errno.h>
 #include <math.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -785,6 +786,202 @@ static int run_daemon(const char *conf) {
     return 0;
 }
 
+/* ----------------------------------------------------------- calibration */
+
+/* What `calibrate` is for.
+ *
+ * The shipped curve is measured on one machine (an M4 mini). On anything else
+ * its RPM numbers are a guess, and guessing is the thing this project tries not
+ * to do. So: put the machine under load, hold the fan at a series of fixed
+ * speeds, and record where the temperature actually settles at each one.
+ *
+ * That measurement is a decreasing function -- more RPM, lower equilibrium --
+ * while a fan curve is increasing. The two therefore cross exactly once, and
+ * that crossing is where the machine will really sit. Which means the useful
+ * question is not "what should the curve look like" but "what RPM holds the
+ * temperature I asked for", and the answer is read straight off the locus. */
+
+#define CAL_LEVELS 5
+#define CAL_SETTLE 75.0   /* seconds held at each speed                    */
+#define CAL_TAIL   25.0   /* average over the last of those, once settled  */
+
+typedef struct { double rpm, temp, peak; } cal_pt;
+
+static volatile sig_atomic_t g_burn = 0;
+
+static void *burn_thread(void *unused) {
+    volatile double x = 1.0;
+    while (g_burn) {
+        for (int i = 0; i < 4096; i++) x = x * 1.0000001 + 1e-9;
+        if (x > 1e6) x = 1.0;
+    }
+    return NULL;
+}
+
+/* Read off the measured locus: the RPM whose equilibrium temperature is `cap`.
+ * Returns -1 if even the fastest measured speed could not hold it. */
+static double rpm_for_cap(const cal_pt *p, int n, double cap) {
+    if (cap >= p[0].temp) return p[0].rpm;        /* the floor already holds it */
+    if (cap < p[n - 1].temp) return -1;           /* out of reach               */
+    for (int i = 1; i < n; i++) {
+        if (cap >= p[i].temp) {
+            double span = p[i - 1].temp - p[i].temp;
+            double f = span > 0.01 ? (p[i - 1].temp - cap) / span : 0;
+            return p[i - 1].rpm + f * (p[i].rpm - p[i - 1].rpm);
+        }
+    }
+    return p[n - 1].rpm;
+}
+
+static int cmd_calibrate(const char *conf, double cap) {
+    if (geteuid() != 0) {
+        fprintf(stderr, "calibrate has to write to the SMC: sudo fanctl calibrate\n");
+        return 1;
+    }
+    cfg_t cfg;
+    cfg_defaults(&cfg);
+    cfg_load(&cfg, conf, true);
+    if (smc_open() != 0) { fprintf(stderr, "cannot open AppleSMC\n"); return 1; }
+
+    fanset_t fans;
+    if (!fanset_init(&fans, cfg.fans)) { fprintf(stderr, "no fan keys found\n"); return 1; }
+    sensors_setup(&cfg);
+    if (g_nsensors == 0) { fprintf(stderr, "no usable temperature sensors\n"); return 1; }
+    cfg.mode = resolve_mode(&fans.f[0], cfg.mode, false);
+
+    double hw_max = 0;
+    for (int i = 0; i < fans.n; i++) hw_max = fmax(hw_max, fans.f[i].hw_max);
+    if (hw_max > 100) cfg.max_rpm = fmin(cfg.max_rpm, hw_max);
+
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu < 1) ncpu = 4;
+    double total = CAL_LEVELS * CAL_SETTLE / 60.0;
+
+    printf("Calibrating against a %ld-thread load, %d fan speeds, ~%.0f minutes.\n",
+           ncpu, CAL_LEVELS, total);
+    printf("The fan will be loud and the machine will be hot and slow throughout.\n");
+    printf("Ctrl-C is safe: the fan is handed back to macOS on the way out.\n\n");
+
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+
+    /* The daemon rewrites the fan every poll and would undo each level within
+     * three seconds, quietly corrupting every reading. Pause it for the
+     * duration through the same flag the menu bar app uses, and leave it as it
+     * was found. */
+    struct stat pst;
+    bool was_paused = (stat(PAUSE_FILE, &pst) == 0);
+    if (!was_paused) {
+        mkdir(RUN_DIR, 0755);
+        FILE *pf = fopen(PAUSE_FILE, "w");
+        if (pf) fclose(pf);
+        printf("Pausing the daemon for the duration.\n");
+        sleep_sec(4.0);   /* let it notice and let go of the fan */
+    }
+    #define CAL_DONE() do { if (!was_paused) unlink(PAUSE_FILE); } while (0)
+
+    pthread_t th[256];
+    long nth = ncpu > 256 ? 256 : ncpu;
+    g_burn = 1;
+    for (long i = 0; i < nth; i++) pthread_create(&th[i], NULL, burn_thread, NULL);
+
+    cal_pt pts[CAL_LEVELS];
+    int npts = 0;
+    bool aborted = false;
+
+    for (int L = 0; L < CAL_LEVELS && !g_stop; L++) {
+        double rpm = cfg.min_rpm
+                   + (cfg.max_rpm - cfg.min_rpm) * L / (double)(CAL_LEVELS - 1);
+        bool wrote = false;
+        fanset_apply(&fans, &cfg, rpm, &wrote);
+
+        double t0 = now_mono(), sum = 0, peak_seen = 0;
+        int nsum = 0;
+        while (now_mono() - t0 < CAL_SETTLE && !g_stop) {
+            double temp, peak;
+            const char *hot = NULL;
+            double el = now_mono() - t0;
+            if (sensors_sample(cfg.aggregate, &temp, &peak, &hot)) {
+                if (peak > peak_seen) peak_seen = peak;
+                if (el >= CAL_SETTLE - CAL_TAIL) { sum += temp; nsum++; }
+                /* Judged on the raw peak, like the daemon's own safety net. */
+                if (peak >= cfg.critical_temp) {
+                    printf("\r  %5.0f rpm  aborting: peak hit %.1f C (critical_temp)\n",
+                           rpm, peak);
+                    aborted = true;
+                    break;
+                }
+                printf("\r  %5.0f rpm  t+%3.0fs  %.1f C (peak %.1f)   ",
+                       rpm, el, temp, peak);
+                fflush(stdout);
+            }
+            sleep_sec(2.0);
+        }
+        if (aborted) break;
+        if (nsum > 0) {
+            pts[npts].rpm = rpm;
+            pts[npts].temp = sum / nsum;
+            pts[npts].peak = peak_seen;
+            printf("\r  %5.0f rpm  settled at %.1f C (peak %.1f)          \n",
+                   rpm, pts[npts].temp, peak_seen);
+            npts++;
+        }
+    }
+
+    g_burn = 0;
+    for (long i = 0; i < nth; i++) pthread_join(th[i], NULL);
+    fanset_release(&fans, &cfg);
+
+    if (g_stop || npts < 2) {
+        printf("\nStopped early - not enough data to suggest a curve.\n");
+        printf("The fan is back on macOS automatic control.\n");
+        CAL_DONE();
+        smc_close();
+        return 1;
+    }
+
+    printf("\nEquilibrium under full load:\n");
+    for (int i = 0; i < npts; i++)
+        printf("  %5.0f rpm  ->  %.1f C\n", pts[i].rpm, pts[i].temp);
+
+    printf("\nRPM needed to hold a given temperature:\n");
+    for (double t = 95; t >= 60; t -= 5) {
+        double r = rpm_for_cap(pts, npts, t);
+        if (r < 0)  printf("  %2.0f C   out of reach on this machine\n", t);
+        else        printf("  %2.0f C   %.0f rpm\n", t, r);
+    }
+
+    double rcap = rpm_for_cap(pts, npts, cap);
+    if (rcap < 0) {
+        printf("\nA %.0f C cap is not reachable even at %.0f rpm.\n", cap, cfg.max_rpm);
+        printf("Pick a higher cap: fanctl calibrate %.0f\n", ceil(pts[npts - 1].temp));
+        CAL_DONE();
+        smc_close();
+        return 1;
+    }
+
+    /* Ramp to the required RPM over the 15 C approaching the cap, then leave a
+     * step above it at maximum so an unexpected load still has somewhere to go. */
+    const double span = 15.0;
+    printf("\nSuggested curve for a %.0f C cap (needs %.0f rpm):\n\n", cap, rcap);
+    printf("curve = 0:%.0f", cfg.min_rpm);
+    for (int i = 1; i <= 4; i++) {
+        double t = cap - span + span * i / 4.0;
+        double r = cfg.min_rpm + (rcap - cfg.min_rpm) * i / 4.0;
+        printf(", %.0f:%.0f", t, round(r / 50) * 50);
+    }
+    printf(", %.0f:%.0f\n", cap + 5, cfg.max_rpm);
+
+    printf("\nMeasured with a synthetic all-core load, which is a worst case:\n");
+    printf("real work will usually sit below this. Paste the line into %s\n", conf);
+    printf("(or edit the curve in the menu bar app) and the daemon reloads itself.\n");
+    printf("The fan is back on macOS automatic control.\n");
+    CAL_DONE();
+    smc_close();
+    return 0;
+}
+#undef CAL_DONE
+
 /* ------------------------------------------------------------- one-shots */
 
 /* Control is suspended through a flag file rather than by stopping the daemon:
@@ -1320,6 +1517,7 @@ static void usage(void) {
 "  fanctl pause               suspend control, fan back to macOS (root)\n"
 "  fanctl resume              resume control (root)\n"
 "  fanctl selftest            check that SMC writes stick (root)\n"
+"  fanctl calibrate [cap C]   measure this machine and suggest a curve (root)\n"
 "  fanctl dump <2-char pfx>   list SMC keys, e.g. 'fanctl dump Tp'\n"
 "  fanctl keyinfo <KEY>...    type, size and access attributes for keys\n"
 "  fanctl trywrite <KEY> <v>  write one key and report what the kernel said\n\n"
@@ -1351,6 +1549,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "pause"))    return cmd_pause(true);
     if (!strcmp(cmd, "resume"))   return cmd_pause(false);
     if (!strcmp(cmd, "selftest")) return cmd_selftest();
+    if (!strcmp(cmd, "calibrate")) return cmd_calibrate(conf, arg ? atof(arg) : 80.0);
     if (!strcmp(cmd, "dump"))     return cmd_dump(arg ? arg : "");
     if (!strcmp(cmd, "keyinfo"))  return cmd_keyinfo(argc - i, argv + i);
     if (!strcmp(cmd, "trywrite"))
