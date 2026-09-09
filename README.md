@@ -102,7 +102,8 @@ Open `Fanctl.app` and a fan icon appears in the menu bar. It stays there while t
 
 | Menu item | What it does |
 | --- | --- |
-| Temperature / RPM / step | Refreshes every 3 s, including while the menu is open |
+| Temperature and RPM in the bar itself | Both, always, in monospaced digits so the item does not jitter as the numbers change. The temperature is coloured: normal, orange from 20 °C below `critical_temp`, red from 8 °C below it — so the thresholds move if you change that setting |
+| Dropdown detail | Peak temperature and which sensor it came from, the curve step, and the target RPM while a ramp is in progress. Refreshes every 3 s, including while the menu is open |
 | Fan control on / off | `fanctl pause` / `resume`. Off means macOS takes over. |
 | Presets | Quiet / Balanced / Cool |
 | Settings… | A draggable curve graph with a live marker. The nine response parameters sit behind an Advanced disclosure, each with a note on what it trades |
@@ -118,7 +119,9 @@ Saving settings rewrites **only the lines whose values changed**, so the comment
 
 The easiest way is to drag it: **Settings…** in the menu bar opens a graph with
 a draggable point per curve step, and a live marker showing where the machine
-currently sits on it.
+currently sits on it. The marker takes the same colour as the menu bar reading —
+grey when the temperature is unremarkable, orange when warm, red when close to
+`critical_temp`.
 
 If you would rather not guess at the numbers at all, measure them:
 

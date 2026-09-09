@@ -24,6 +24,10 @@ final class CurveEditorView: NSView {
     /// machine currently sits on the curve you are editing.
     var live: (temp: Double, rpm: Double)? { didSet { needsDisplay = true } }
 
+    /// Feeds the marker's colour, so warm and hot mean the same thing here as
+    /// they do in the menu bar.
+    var criticalTemp: Double = 98
+
     private let tMin = 30.0
     private let tMax = 100.0
     private let handleR: CGFloat = 5
@@ -148,20 +152,29 @@ final class CurveEditorView: NSView {
         // live marker
         if let live {
             let x = px(live.temp), y = py(live.rpm)
+            // Grey when normal rather than a colour: at normal temperature the
+            // marker is only saying "you are here", and a warm hue there would
+            // read as a warning that is not being made.
+            let hc = heatColor(live.temp, critical: criticalTemp)
+            let mark = hc == .labelColor ? NSColor.systemGray : hc
             let v = NSBezierPath()
             v.move(to: NSPoint(x: x, y: plot.minY))
             v.line(to: NSPoint(x: x, y: plot.maxY))
             v.lineWidth = 1
             v.setLineDash([3, 3], count: 2, phase: 0)
-            NSColor.systemOrange.withAlphaComponent(0.7).setStroke()
+            mark.withAlphaComponent(0.7).setStroke()
             v.stroke()
 
-            NSColor.systemOrange.setFill()
+            mark.setFill()
             NSBezierPath(ovalIn: NSRect(x: x - 4, y: y - 4, width: 8, height: 8)).fill()
-            let now = String(format: "%.0f°C  %.0f rpm", live.temp, live.rpm)
-            (now as NSString).draw(
-                at: NSPoint(x: min(x + 8, plot.maxX - 76), y: plot.maxY - 12),
-                withAttributes: [.font: label, .foregroundColor: NSColor.systemOrange])
+            // Measured, not a guessed offset: the readout is wider than a fixed
+            // clamp allowed for and ran off the right edge. Flips to the left of
+            // the marker when there is no room on the right.
+            let now = String(format: "%.0f°C  %.0f rpm", live.temp, live.rpm) as NSString
+            let ra: [NSAttributedString.Key: Any] = [.font: label, .foregroundColor: mark]
+            let tw = now.size(withAttributes: ra).width
+            let tx = x + 8 + tw <= plot.maxX ? x + 8 : max(plot.minX, x - 8 - tw)
+            now.draw(at: NSPoint(x: tx, y: plot.maxY - 12), withAttributes: ra)
         }
 
         // handles
