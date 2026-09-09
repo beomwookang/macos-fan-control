@@ -19,11 +19,13 @@ $(BIN): $(SRC) src/smc.h
 # whole project stays `make && sudo ./install.sh`. Ad-hoc signed: it is only
 # ever installed locally, and the login item is a LaunchAgent rather than
 # SMAppService precisely so no Developer ID is needed.
-$(APP): app/main.swift app/Info.plist
+SWIFT = app/main.swift app/CurveEditor.swift
+
+$(APP): $(SWIFT) app/Info.plist
 	@rm -rf $(APP)
 	@mkdir -p $(APP)/Contents/MacOS
-	swiftc -O -target arm64-apple-macos13.0   -o build/.Fanctl-arm64  app/main.swift
-	swiftc -O -target x86_64-apple-macos13.0  -o build/.Fanctl-x86_64 app/main.swift
+	swiftc -O -target arm64-apple-macos13.0   -o build/.Fanctl-arm64  $(SWIFT)
+	swiftc -O -target x86_64-apple-macos13.0  -o build/.Fanctl-x86_64 $(SWIFT)
 	lipo -create -output $(APP)/Contents/MacOS/Fanctl build/.Fanctl-arm64 build/.Fanctl-x86_64
 	@rm -f build/.Fanctl-arm64 build/.Fanctl-x86_64
 	cp app/Info.plist $(APP)/Contents/Info.plist

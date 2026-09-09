@@ -49,7 +49,7 @@ func admin(_ verb: String, input: String? = nil) -> (code: Int32, out: String) {
 
 // MARK: - status
 
-struct CurvePoint: Codable { let t: Double; let rpm: Double }
+struct CurvePoint: Codable { var t: Double; var rpm: Double }
 
 struct Status: Codable {
     let ok: Bool
@@ -178,14 +178,17 @@ let presets: [Preset] = [
 
 // MARK: - settings window
 
+/// Curve first, numbers second. The window opens on a draggable graph; the nine
+/// response parameters are real but rarely touched, so they sit behind a
+/// disclosure rather than greeting everyone who wants the fan a bit quieter.
 final class SettingsWindow: NSWindowController, NSWindowDelegate {
     private var fields: [String: NSTextField] = [:]
-    private let curveField = NSTextField()
+    private let editor = CurveEditorView(frame: NSRect(x: 0, y: 0, width: 520, height: 250))
     private let note = NSTextField(labelWithString: "")
+    private let advancedToggle = NSButton()
+    private var advanced = NSStackView()
+    private var stack = NSStackView()
 
-    /// key, label, and the one-line reason it exists. The explanations are the
-    /// point of this window: every number here is a trade, and a bare spin box
-    /// invites people to change things without knowing which way is which.
     private let rows: [(String, String, String)] = [
         ("slew_up",       "Rise limit (rpm/s)",   "Lower means the fan swells slowly and draws less attention. 0 = no limit"),
         ("slew_down",     "Fall limit (rpm/s)",   "Lower means it also quietens down gradually"),
@@ -199,7 +202,7 @@ final class SettingsWindow: NSWindowController, NSWindowDelegate {
     ]
 
     convenience init(status: Status) {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 520),
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 580, height: 420),
                          styleMask: [.titled, .closable], backing: .buffered, defer: false)
         w.title = "fanctl Settings"
         self.init(window: w)
@@ -215,27 +218,58 @@ final class SettingsWindow: NSWindowController, NSWindowDelegate {
         return t
     }
 
+    /// Live reading pushed in by the menu bar app, so the marker on the graph
+    /// tracks the machine while you are editing the curve it follows.
+    func updateLive(_ st: Status) {
+        guard st.ok, st.have_temp else { return }
+        editor.live = (temp: st.temp, rpm: st.rpm)
+    }
+
     private func build(_ st: Status) {
-        let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 14
-        stack.edgeInsets = NSEdgeInsets(top: 18, left: 20, bottom: 18, right: 20)
+        stack.spacing = 10
+        stack.edgeInsets = NSEdgeInsets(top: 16, left: 20, bottom: 16, right: 20)
         stack.translatesAutoresizingMaskIntoConstraints = false
 
-        let curveTitle = label("Fan curve", size: 13)
-        curveTitle.font = .boldSystemFont(ofSize: 13)
-        stack.addArrangedSubview(curveTitle)
-        curveField.stringValue = st.curve.map { "\(Int($0.t)):\(Int($0.rpm))" }.joined(separator: ", ")
-        curveField.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        curveField.widthAnchor.constraint(equalToConstant: 500).isActive = true
-        stack.addArrangedSubview(curveField)
-        stack.addArrangedSubview(label("\"temperature:RPM\" pairs, ascending. The first entry's temperature is always treated as 0",
-                                       size: 11, color: .secondaryLabelColor))
+        let title = label("Fan curve")
+        title.font = .boldSystemFont(ofSize: 13)
 
-        let tuneTitle = label("Response", size: 13)
-        tuneTitle.font = .boldSystemFont(ofSize: 13)
-        stack.addArrangedSubview(tuneTitle)
+        var presetButtons: [NSView] = [title, NSView()]
+        for (i, p) in presets.enumerated() {
+            let b = NSButton(title: p.name, target: self, action: #selector(loadPreset(_:)))
+            b.tag = i
+            b.bezelStyle = .rounded
+            b.controlSize = .small
+            b.toolTip = p.detail
+            presetButtons.append(b)
+        }
+        let titleRow = NSStackView(views: presetButtons)
+        titleRow.spacing = 6
+        titleRow.widthAnchor.constraint(equalToConstant: 528).isActive = true
+        stack.addArrangedSubview(titleRow)
+
+        editor.minRPM = st.min_rpm > 0 ? st.min_rpm : 1000
+        editor.maxRPM = st.max_rpm > 0 ? st.max_rpm : 4900
+        editor.setPoints(st.curve)
+        editor.onChange = { [weak self] _ in self?.note.stringValue = "" }
+        editor.translatesAutoresizingMaskIntoConstraints = false
+        editor.widthAnchor.constraint(equalToConstant: 528).isActive = true
+        editor.heightAnchor.constraint(equalToConstant: 250).isActive = true
+        stack.addArrangedSubview(editor)
+        stack.addArrangedSubview(label(
+            "Drag a point to move it · double-click to add · ⌫ to remove · the leftmost point is the base speed",
+            size: 11, color: .secondaryLabelColor))
+
+        advancedToggle.setButtonType(.onOff)
+        advancedToggle.bezelStyle = .disclosure
+        advancedToggle.title = ""
+        advancedToggle.target = self
+        advancedToggle.action = #selector(toggleAdvanced)
+        let advLabel = label("Advanced", size: 12)
+        let advRow = NSStackView(views: [advancedToggle, advLabel])
+        advRow.spacing = 4
+        stack.addArrangedSubview(advRow)
 
         let grid = NSGridView(numberOfColumns: 3, rows: 0)
         grid.rowSpacing = 7
@@ -257,7 +291,12 @@ final class SettingsWindow: NSWindowController, NSWindowDelegate {
                                label(why, size: 11, color: .secondaryLabelColor)])
         }
         grid.column(at: 0).xPlacement = .trailing
-        stack.addArrangedSubview(grid)
+
+        advanced = NSStackView(views: [grid])
+        advanced.orientation = .vertical
+        advanced.alignment = .leading
+        advanced.isHidden = true
+        stack.addArrangedSubview(advanced)
 
         note.font = .systemFont(ofSize: 11)
         note.textColor = .secondaryLabelColor
@@ -265,9 +304,10 @@ final class SettingsWindow: NSWindowController, NSWindowDelegate {
 
         let save = NSButton(title: "Save", target: self, action: #selector(save))
         save.keyEquivalent = "\r"
-        let cancel = NSButton(title: "Close", target: self, action: #selector(close_))
-        let buttons = NSStackView(views: [cancel, save])
+        let close = NSButton(title: "Close", target: self, action: #selector(close_))
+        let buttons = NSStackView(views: [NSView(), close, save])
         buttons.spacing = 10
+        buttons.widthAnchor.constraint(equalToConstant: 528).isActive = true
         stack.addArrangedSubview(buttons)
 
         let content = NSView()
@@ -275,15 +315,44 @@ final class SettingsWindow: NSWindowController, NSWindowDelegate {
         NSLayoutConstraint.activate([
             stack.topAnchor.constraint(equalTo: content.topAnchor),
             stack.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            stack.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: content.bottomAnchor),
+            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: content.bottomAnchor),
         ])
         window?.contentView = content
+        resize()
+    }
+
+    private func resize() {
+        guard let w = window else { return }
+        w.setContentSize(stack.fittingSize)
     }
 
     private func fmt(_ d: Double) -> String {
         d == d.rounded() && abs(d) < 1e6 && d >= 1
             ? String(Int(d)) : String(format: "%g", d)
+    }
+
+    private func parseCurve(_ s: String) -> [CurvePoint] {
+        s.split(separator: ",").compactMap { part in
+            let kv = part.trimmingCharacters(in: .whitespaces).split(separator: ":")
+            guard kv.count == 2, let t = Double(kv[0]), let r = Double(kv[1]) else { return nil }
+            return CurvePoint(t: t, rpm: r)
+        }
+    }
+
+    @objc private func toggleAdvanced() {
+        advanced.isHidden = (advancedToggle.state != .on)
+        resize()
+    }
+
+    /// A preset fills the form rather than saving straight away: the point of
+    /// having them here is to give the curve a sane starting shape to drag from.
+    @objc private func loadPreset(_ sender: NSButton) {
+        let p = presets[sender.tag]
+        if let c = p.values["curve"] { editor.setPoints(parseCurve(c)) }
+        for (k, v) in p.values where k != "curve" { fields[k]?.stringValue = v }
+        note.textColor = .secondaryLabelColor
+        note.stringValue = "Loaded the \(p.name) preset. Save to apply it."
     }
 
     @objc private func close_() { window?.close() }
@@ -293,12 +362,16 @@ final class SettingsWindow: NSWindowController, NSWindowDelegate {
         for (key, name, _) in rows {
             let raw = fields[key]?.stringValue.trimmingCharacters(in: .whitespaces) ?? ""
             guard let v = Double(raw), v >= 0 else {
+                advancedToggle.state = .on
+                toggleAdvanced()
                 fail("\(name): not a number - \"\(raw)\"")
                 return
             }
             kv[key] = raw
         }
-        let curve = curveField.stringValue.trimmingCharacters(in: .whitespaces)
+        let curve = editor.points
+            .map { "\(Int($0.t)):\(Int($0.rpm))" }
+            .joined(separator: ", ")
         if let err = validateCurve(curve) { fail(err); return }
         kv["curve"] = curve
 
@@ -310,9 +383,8 @@ final class SettingsWindow: NSWindowController, NSWindowDelegate {
         }
     }
 
-    /// Catch the mistakes that would otherwise be accepted by the parser and
-    /// then behave strangely: an unsorted curve silently never reaches its
-    /// upper steps, and an empty one leaves the fan at a single speed.
+    /// The editor keeps the points ordered and in range, so this is a backstop
+    /// for a curve that arrived from a preset or an older config file.
     private func validateCurve(_ s: String) -> String? {
         let parts = s.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
         if parts.isEmpty { return "The curve is empty" }
@@ -467,6 +539,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !(state["installed"] ?? true) {
             detailItem.title = "The daemon is not installed (sudo ./install.sh)"
         }
+
+        // Keep the marker on an open curve editor tracking the machine.
+        if let st, settings?.window?.isVisible == true { settings?.updateLive(st) }
 
         toggleItem.title = running ? "Turn Fan Control Off (hand back to macOS)" : "Turn Fan Control On"
         loginItem.state = LoginItem.enabled ? .on : .off
