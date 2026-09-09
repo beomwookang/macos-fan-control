@@ -144,6 +144,7 @@ If you would rather not guess at the numbers at all, measure them:
 ```sh
 sudo fanctl calibrate        # cap the die at 80 C (the default)
 sudo fanctl calibrate 75     # or wherever you want it capped
+fanctl -n calibrate          # dry run: check the path, write nothing, no root
 ```
 
 This runs an all-core load and holds the fan at a series of fixed speeds,
@@ -172,6 +173,11 @@ while a fan curve *rises* with temperature, so the two cross exactly once — an
 that crossing is where the machine will really sit. The useful question is
 therefore not what the curve should look like, but what RPM holds the
 temperature you asked for.
+
+That the locus falls is also the assumption the whole method rests on, so it is
+checked rather than assumed. If the temperature does not drop as the fan speeds
+up, calibrate says so and suggests nothing — a run spoiled by a competing load
+or too short a settle produces a flat, plausible-looking curve otherwise.
 
 ### Editing it by hand
 
@@ -358,9 +364,15 @@ the rules exist to stop a drag producing a curve the daemon accepts and then
 behaves oddly on, so testing below the event layer would not test them. It
 creates no window and runs on a headless machine.
 
-Not covered, and worth knowing before trusting either: `fanctl calibrate` has
-no automated test beyond its interpolation, and the multi-fan path has only
-ever run on a machine with one fan.
+`fanctl -n calibrate` exercises the rest of calibrate — the load, the sampling,
+the settle loop, the safety guard and the derivation — without root and without
+touching the SMC. It uses a short settle because a dry run cannot measure
+anything real anyway: the fan is not being controlled, so the equilibrium it
+would wait for does not exist. Its purpose is to check the path.
+
+Not covered, and worth knowing before trusting either: calibrate's SMC writes
+and its pause interlock have only been exercised by hand, and the multi-fan
+path has only ever run on a machine with one fan.
 
 ## Uninstall
 

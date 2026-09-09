@@ -109,6 +109,9 @@ static void cfg_defaults(cfg_t *c) {
 
 static bool g_dry = false;   /* -n: decide and log, but never write */
 static bool g_json = false;  /* -j: machine-readable status, for the UI */
+/* Progress that redraws itself is only progress on a terminal. Redirected,
+ * carriage returns pile every sample onto one unreadable line. */
+static bool g_tty = false;
 static bool g_verbose = false; /* -v: log every poll, for tuning the curve */
 
 static void logf_(const char *fmt, ...) {
@@ -804,6 +807,7 @@ static int run_daemon(const char *conf) {
 #define CAL_LEVELS 5
 #define CAL_SETTLE 75.0   /* seconds held at each speed                    */
 #define CAL_TAIL   25.0   /* average over the last of those, once settled  */
+#define CAL_DRY_SETTLE 6.0 /* -n: long enough to exercise the loop, no more */
 
 typedef struct { double rpm, temp, peak; } cal_pt;
 
@@ -834,7 +838,13 @@ static double rpm_for_cap(const cal_pt *p, int n, double cap) {
 }
 
 static int cmd_calibrate(const char *conf, double cap) {
-    if (geteuid() != 0) {
+    /* -n exercises everything except the SMC: the load, the sampling, the
+     * settle loop, the safety guard and the derivation. It needs no root
+     * because it writes nothing, and it uses a short settle because a dry run
+     * cannot measure anything real anyway -- the fan is not being controlled,
+     * so the equilibrium it would wait for does not exist. Its purpose is to
+     * check the path, not the machine. */
+    if (!g_dry && geteuid() != 0) {
         fprintf(stderr, "calibrate has to write to the SMC: sudo fanctl calibrate\n");
         return 1;
     }
@@ -855,12 +865,20 @@ static int cmd_calibrate(const char *conf, double cap) {
 
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     if (ncpu < 1) ncpu = 4;
-    double total = CAL_LEVELS * CAL_SETTLE / 60.0;
+    double settle = g_dry ? CAL_DRY_SETTLE : CAL_SETTLE;
 
-    printf("Calibrating against a %ld-thread load, %d fan speeds, ~%.0f minutes.\n",
-           ncpu, CAL_LEVELS, total);
-    printf("The fan will be loud and the machine will be hot and slow throughout.\n");
-    printf("Ctrl-C is safe: the fan is handed back to macOS on the way out.\n\n");
+    if (g_dry) {
+        printf("[dry] Path check only: no SMC writes, %.0fs per step, and the\n"
+               "[dry] daemon is left running -- so the temperatures below are not\n"
+               "[dry] equilibria and the suggested curve is not usable.\n\n", settle);
+    }
+    printf("Calibrating against a %ld-thread load, %d fan speeds, ~%.1f minutes.\n",
+           ncpu, CAL_LEVELS, CAL_LEVELS * settle / 60.0);
+    if (!g_dry) {
+        printf("The fan will be loud and the machine will be hot and slow throughout.\n");
+        printf("Ctrl-C is safe: the fan is handed back to macOS on the way out.\n");
+    }
+    printf("\n");
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
@@ -870,7 +888,7 @@ static int cmd_calibrate(const char *conf, double cap) {
      * duration through the same flag the menu bar app uses, and leave it as it
      * was found. */
     struct stat pst;
-    bool was_paused = (stat(PAUSE_FILE, &pst) == 0);
+    bool was_paused = g_dry || (stat(PAUSE_FILE, &pst) == 0);
     if (!was_paused) {
         mkdir(RUN_DIR, 0755);
         FILE *pf = fopen(PAUSE_FILE, "w");
@@ -893,27 +911,29 @@ static int cmd_calibrate(const char *conf, double cap) {
         double rpm = cfg.min_rpm
                    + (cfg.max_rpm - cfg.min_rpm) * L / (double)(CAL_LEVELS - 1);
         bool wrote = false;
-        fanset_apply(&fans, &cfg, rpm, &wrote);
+        if (!g_dry) fanset_apply(&fans, &cfg, rpm, &wrote);
 
         double t0 = now_mono(), sum = 0, peak_seen = 0;
         int nsum = 0;
-        while (now_mono() - t0 < CAL_SETTLE && !g_stop) {
+        while (now_mono() - t0 < settle && !g_stop) {
             double temp, peak;
             const char *hot = NULL;
             double el = now_mono() - t0;
             if (sensors_sample(cfg.aggregate, &temp, &peak, &hot)) {
                 if (peak > peak_seen) peak_seen = peak;
-                if (el >= CAL_SETTLE - CAL_TAIL) { sum += temp; nsum++; }
+                if (el >= settle - fmin(CAL_TAIL, settle / 2)) { sum += temp; nsum++; }
                 /* Judged on the raw peak, like the daemon's own safety net. */
                 if (peak >= cfg.critical_temp) {
-                    printf("\r  %5.0f rpm  aborting: peak hit %.1f C (critical_temp)\n",
-                           rpm, peak);
+                    printf("%s  %5.0f rpm  aborting: peak hit %.1f C (critical_temp)\n",
+                           g_tty ? "\r" : "", rpm, peak);
                     aborted = true;
                     break;
                 }
-                printf("\r  %5.0f rpm  t+%3.0fs  %.1f C (peak %.1f)   ",
-                       rpm, el, temp, peak);
-                fflush(stdout);
+                if (g_tty) {
+                    printf("\r  %s%5.0f rpm  t+%3.0fs  %.1f C (peak %.1f)   ",
+                           g_dry ? "[dry] " : "", rpm, el, temp, peak);
+                    fflush(stdout);
+                }
             }
             sleep_sec(2.0);
         }
@@ -922,15 +942,17 @@ static int cmd_calibrate(const char *conf, double cap) {
             pts[npts].rpm = rpm;
             pts[npts].temp = sum / nsum;
             pts[npts].peak = peak_seen;
-            printf("\r  %5.0f rpm  settled at %.1f C (peak %.1f)          \n",
-                   rpm, pts[npts].temp, peak_seen);
+            printf("%s  %s%5.0f rpm  %s %.1f C (peak %.1f)          \n",
+                   g_tty ? "\r" : "",
+                   g_dry ? "[dry] " : "", rpm,
+                   g_dry ? "sampled  " : "settled at", pts[npts].temp, peak_seen);
             npts++;
         }
     }
 
     g_burn = 0;
     for (long i = 0; i < nth; i++) pthread_join(th[i], NULL);
-    fanset_release(&fans, &cfg);
+    if (!g_dry) fanset_release(&fans, &cfg);
 
     if (g_stop || npts < 2) {
         printf("\nStopped early - not enough data to suggest a curve.\n");
@@ -940,9 +962,36 @@ static int cmd_calibrate(const char *conf, double cap) {
         return 1;
     }
 
-    printf("\nEquilibrium under full load:\n");
+    printf(g_dry ? "\n[dry] Sampled under load (not equilibria):\n"
+                 : "\nEquilibrium under full load:\n");
     for (int i = 0; i < npts; i++)
         printf("  %5.0f rpm  ->  %.1f C\n", pts[i].rpm, pts[i].temp);
+
+    /* The locus has to fall for any of this to mean anything: the method rests
+     * entirely on "more RPM, lower equilibrium". A run where it does not fall is
+     * not a curve waiting to be derived, it is a measurement to be thrown away.
+     * Saying so beats the flat nonsense the interpolation would otherwise
+     * produce and present as an answer. */
+    double drop = pts[0].temp - pts[npts - 1].temp;
+    if (drop < 3.0) {
+        printf("\nThe temperature did not fall as the fan sped up"
+               " (%.1f C across %.0f-%.0f rpm).\n", drop, pts[0].rpm, pts[npts - 1].rpm);
+        printf("That is not a usable measurement. Likely causes:\n");
+        if (g_dry)
+            printf("  - this is a dry run, so the fan was never actually controlled\n");
+        printf("  - something else was loading the machine, so the fan was not"
+               " the only variable\n");
+        printf("  - the settle time was too short for this machine's thermal mass\n");
+        printf("  - the fan genuinely has little authority over this sensor\n");
+        CAL_DONE();
+        smc_close();
+        return 1;
+    }
+
+    /* Small inversions are sampling noise, not physics. A running minimum keeps
+     * the locus non-increasing so the interpolation cannot walk backwards. */
+    for (int i = 1; i < npts; i++)
+        if (pts[i].temp > pts[i - 1].temp) pts[i].temp = pts[i - 1].temp;
 
     printf("\nRPM needed to hold a given temperature:\n");
     for (double t = 95; t >= 60; t -= 5) {
@@ -972,10 +1021,15 @@ static int cmd_calibrate(const char *conf, double cap) {
     }
     printf(", %.0f:%.0f\n", cap + 5, cfg.max_rpm);
 
-    printf("\nMeasured with a synthetic all-core load, which is a worst case:\n");
-    printf("real work will usually sit below this. Paste the line into %s\n", conf);
-    printf("(or edit the curve in the menu bar app) and the daemon reloads itself.\n");
-    printf("The fan is back on macOS automatic control.\n");
+    if (g_dry) {
+        printf("\n[dry] Path check finished. Nothing was written and the numbers\n");
+        printf("[dry] above are not usable -- run without -n for a real one.\n");
+    } else {
+        printf("\nMeasured with a synthetic all-core load, which is a worst case:\n");
+        printf("real work will usually sit below this. Paste the line into %s\n", conf);
+        printf("(or edit the curve in the menu bar app) and the daemon reloads itself.\n");
+        printf("The fan is back on macOS automatic control.\n");
+    }
     CAL_DONE();
     smc_close();
     return 0;
@@ -1518,6 +1572,7 @@ static void usage(void) {
 "  fanctl resume              resume control (root)\n"
 "  fanctl selftest            check that SMC writes stick (root)\n"
 "  fanctl calibrate [cap C]   measure this machine and suggest a curve (root)\n"
+"  fanctl -n calibrate        dry run: check the path, write nothing, no root\n"
 "  fanctl dump <2-char pfx>   list SMC keys, e.g. 'fanctl dump Tp'\n"
 "  fanctl keyinfo <KEY>...    type, size and access attributes for keys\n"
 "  fanctl trywrite <KEY> <v>  write one key and report what the kernel said\n\n"
@@ -1537,6 +1592,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-j") || !strcmp(argv[i], "--json")) g_json = true;
         else break;
     }
+    g_tty = isatty(1);
+
     if (i >= argc) { usage(); return 0; }
 
     const char *cmd = argv[i++];
