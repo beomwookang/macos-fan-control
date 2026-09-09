@@ -20,123 +20,141 @@ private func frac(_ v: Double, _ lo: Double, _ hi: Double) -> CGFloat {
     return CGFloat(min(max((v - lo) / (hi - lo), 0), 1))
 }
 
-func statusIcon(temp: Double?, rpm: Double, minRPM: Double, maxRPM: Double,
+/// Draws the gauge glyph into the current context at the given origin.
+private func drawGauges(at o: NSPoint, temp: Double?, rpm: Double,
+                        minRPM: Double, maxRPM: Double, critical: Double, running: Bool) {
+    // Dimmed as a whole when control is off, so the mark reads as inactive
+    // before you have parsed either gauge.
+    let dim: CGFloat = running ? 1.0 : 0.4
+    let ink = NSColor.labelColor.withAlphaComponent(0.85 * dim)
+    let track = NSColor.labelColor.withAlphaComponent(0.22 * dim)
+
+    // --- fan: a ring that fills clockwise with RPM
+    let c = NSPoint(x: o.x + 8.5, y: o.y + 9)
+    let r: CGFloat = 7.2
+
+    let ring = NSBezierPath(ovalIn: NSRect(x: c.x - r, y: c.y - r, width: r * 2, height: r * 2))
+    ring.lineWidth = 1.6
+    track.setStroke()
+    ring.stroke()
+
+    let f = frac(rpm, minRPM, maxRPM)
+    if f > 0.005 {
+        let gauge = NSBezierPath()
+        // Starts at 12 o'clock and sweeps clockwise, the direction a dial is
+        // read, rather than the counter-clockwise default.
+        gauge.appendArc(withCenter: c, radius: r, startAngle: 90,
+                        endAngle: 90 - Double(f) * 360, clockwise: true)
+        gauge.lineWidth = 1.6
+        gauge.lineCapStyle = .round
+        NSColor.controlAccentColor.withAlphaComponent(dim).setStroke()
+        gauge.stroke()
+    }
+
+    // Three swept blades rather than four symmetric ones: at this size a
+    // symmetric petal reads as a flower, and the sweep gives it a direction.
+    // The angle advances with RPM, so successive redraws show the fan having
+    // turned further when it is spinning faster.
+    let spin = Double(f) * 120.0
+    func pt(_ a: Double, _ d: CGFloat) -> NSPoint {
+        NSPoint(x: c.x + cos(a) * d, y: c.y + sin(a) * d)
+    }
+    for i in 0..<3 {
+        let a = (Double(i) * 120.0 + spin) * .pi / 180
+        let blade = NSBezierPath()
+        blade.move(to: pt(a - 0.30, 1.4))
+        // Leading edge sweeps ahead of the root, trailing edge cuts back to it
+        // -- a comma, which is what a fan blade looks like end-on.
+        blade.curve(to: pt(a + 0.62, 5.2),
+                    controlPoint1: pt(a - 0.10, 4.2),
+                    controlPoint2: pt(a + 0.30, 5.2))
+        blade.curve(to: pt(a - 0.30, 1.4),
+                    controlPoint1: pt(a + 0.95, 3.6),
+                    controlPoint2: pt(a + 0.70, 1.8))
+        ink.setFill()
+        blade.fill()
+    }
+    NSColor.labelColor.withAlphaComponent(dim).setFill()
+    NSBezierPath(ovalIn: NSRect(x: c.x - 1.1, y: c.y - 1.1, width: 2.2, height: 2.2)).fill()
+
+    // --- thermometer: column height and colour both track the reading
+    let tx = o.x + 20.5
+    let bulbR: CGFloat = 2.4
+    let bulb = NSPoint(x: tx, y: o.y + 3.2)
+    let stemTop = o.y + 15.6
+    let stemW: CGFloat = 2.2
+
+    let outline = NSBezierPath()
+    outline.appendOval(in: NSRect(x: bulb.x - bulbR, y: bulb.y - bulbR,
+                                  width: bulbR * 2, height: bulbR * 2))
+    outline.appendRoundedRect(NSRect(x: tx - stemW / 2, y: bulb.y,
+                                     width: stemW, height: stemTop - bulb.y),
+                              xRadius: stemW / 2, yRadius: stemW / 2)
+    track.setFill()
+    outline.fill()
+
+    guard let temp else { return }
+    // Scaled from 40 C, not 0: nothing below that is worth a pixel of travel on
+    // a 12pt column, and starting there makes the useful range legible.
+    let heat = heatColor(temp, critical: critical).withAlphaComponent(dim)
+    let hf = frac(temp, 40, max(critical, 60))
+    let colH = (stemTop - bulb.y - stemW / 2) * hf
+
+    let merc = NSBezierPath()
+    merc.appendOval(in: NSRect(x: bulb.x - bulbR + 0.6, y: bulb.y - bulbR + 0.6,
+                               width: (bulbR - 0.6) * 2, height: (bulbR - 0.6) * 2))
+    if colH > 0.5 {
+        merc.appendRoundedRect(NSRect(x: tx - (stemW - 1.2) / 2, y: bulb.y,
+                                      width: stemW - 1.2, height: colH),
+                               xRadius: (stemW - 1.2) / 2, yRadius: (stemW - 1.2) / 2)
+    }
+    heat.setFill()
+    merc.fill()
+}
+
+/// The whole menu bar item as one image: gauges, then temperature over RPM.
+///
+/// The text is drawn here rather than handed to the button as a two-line
+/// attributedTitle. NSStatusBarButton centres a title by its own reckoning, and
+/// for two lines that reckoning put the block too high and clipped the top of
+/// the temperature. Drawing it means the baselines are stated outright.
+func statusMark(temp: Double?, rpm: Double, minRPM: Double, maxRPM: Double,
                 critical: Double, running: Bool) -> NSImage {
-    let img = NSImage(size: NSSize(width: ICON_W, height: ICON_H), flipped: false) { _ in
-        // Dimmed as a whole when control is off, so the mark reads as inactive
-        // before you have parsed either gauge.
-        let dim: CGFloat = running ? 1.0 : 0.4
-        let ink = NSColor.labelColor.withAlphaComponent(0.85 * dim)
-        let track = NSColor.labelColor.withAlphaComponent(0.22 * dim)
+    let H: CGFloat = 18
+    let gaugeW: CGFloat = 25
+    let gap: CGFloat = 5
 
-        // --- fan, left: a ring that fills clockwise with RPM
-        let c = NSPoint(x: 8.5, y: 9)
-        let r: CGFloat = 7.2
+    let font = NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .medium)
+    let topStr = (temp.map { String(format: "%.0f°", $0) } ?? "--°") as NSString
+    let botStr = (rpm > 0 ? String(format: "%.0f", rpm) : "--") as NSString
+    let topColor = temp.map { heatColor($0, critical: critical) } ?? NSColor.secondaryLabelColor
+    let topAttrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: topColor]
+    let botAttrs: [NSAttributedString.Key: Any] = [
+        .font: font,
+        .foregroundColor: NSColor.labelColor.withAlphaComponent(running ? 1 : 0.5),
+    ]
+    let textW = max(topStr.size(withAttributes: topAttrs).width,
+                    botStr.size(withAttributes: botAttrs).width)
 
-        let ring = NSBezierPath(ovalIn: NSRect(x: c.x - r, y: c.y - r, width: r * 2, height: r * 2))
-        ring.lineWidth = 1.6
-        track.setStroke()
-        ring.stroke()
-
-        let f = frac(rpm, minRPM, maxRPM)
-        if f > 0.005 {
-            let gauge = NSBezierPath()
-            // Starts at 12 o'clock and sweeps clockwise, the direction a dial is
-            // read, rather than the counter-clockwise default.
-            gauge.appendArc(withCenter: c, radius: r, startAngle: 90,
-                            endAngle: 90 - Double(f) * 360, clockwise: true)
-            gauge.lineWidth = 1.6
-            gauge.lineCapStyle = .round
-            NSColor.controlAccentColor.withAlphaComponent(dim).setStroke()
-            gauge.stroke()
-        }
-
-        // Three swept blades rather than four symmetric ones: at this size a
-        // symmetric petal reads as a flower, and the sweep gives it a direction.
-        // The angle advances with RPM, so successive redraws show the fan having
-        // turned further when it is spinning faster.
-        let spin = Double(f) * 120.0
-        func pt(_ a: Double, _ d: CGFloat) -> NSPoint {
-            NSPoint(x: c.x + cos(a) * d, y: c.y + sin(a) * d)
-        }
-        for i in 0..<3 {
-            let a = (Double(i) * 120.0 + spin) * .pi / 180
-            let blade = NSBezierPath()
-            blade.move(to: pt(a - 0.30, 1.4))
-            // Leading edge sweeps ahead of the root, trailing edge cuts back to
-            // it -- a comma, which is what a fan blade looks like end-on.
-            blade.curve(to: pt(a + 0.62, 5.2),
-                        controlPoint1: pt(a - 0.10, 4.2),
-                        controlPoint2: pt(a + 0.30, 5.2))
-            blade.curve(to: pt(a - 0.30, 1.4),
-                        controlPoint1: pt(a + 0.95, 3.6),
-                        controlPoint2: pt(a + 0.70, 1.8))
-            ink.setFill()
-            blade.fill()
-        }
-        NSColor.labelColor.withAlphaComponent(dim).setFill()
-        NSBezierPath(ovalIn: NSRect(x: c.x - 1.1, y: c.y - 1.1, width: 2.2, height: 2.2)).fill()
-
-        // --- thermometer, right: column height and colour both track the reading
-        let tx: CGFloat = 20.5
-        let bulbR: CGFloat = 2.4
-        let bulb = NSPoint(x: tx, y: 3.2)
-        let stemTop: CGFloat = 15.6
-        let stemW: CGFloat = 2.2
-
-        let outline = NSBezierPath()
-        outline.appendOval(in: NSRect(x: bulb.x - bulbR, y: bulb.y - bulbR,
-                                      width: bulbR * 2, height: bulbR * 2))
-        outline.appendRoundedRect(NSRect(x: tx - stemW / 2, y: bulb.y,
-                                         width: stemW, height: stemTop - bulb.y),
-                                  xRadius: stemW / 2, yRadius: stemW / 2)
-        track.setFill()
-        outline.fill()
-
-        guard let temp else { return true }
-        // Scaled from 40 C, not 0: nothing below that is worth a pixel of travel
-        // on an 12pt column, and starting there makes the useful range legible.
-        let heat = heatColor(temp, critical: critical).withAlphaComponent(dim)
-        let hf = frac(temp, 40, max(critical, 60))
-        let colH = (stemTop - bulb.y - stemW / 2) * hf
-
-        let merc = NSBezierPath()
-        merc.appendOval(in: NSRect(x: bulb.x - bulbR + 0.6, y: bulb.y - bulbR + 0.6,
-                                   width: (bulbR - 0.6) * 2, height: (bulbR - 0.6) * 2))
-        if colH > 0.5 {
-            merc.appendRoundedRect(NSRect(x: tx - (stemW - 1.2) / 2, y: bulb.y,
-                                          width: stemW - 1.2, height: colH),
-                                   xRadius: (stemW - 1.2) / 2, yRadius: (stemW - 1.2) / 2)
-        }
-        heat.setFill()
-        merc.fill()
+    let img = NSImage(size: NSSize(width: gaugeW + gap + textW, height: H), flipped: false) { _ in
+        drawGauges(at: .zero, temp: temp, rpm: rpm, minRPM: minRPM, maxRPM: maxRPM,
+                   critical: critical, running: running)
+        // draw(at:) takes the lower-left of the glyph box, and a 9pt box is
+        // about 11pt tall -- two of them stacked naively do not fit 18pt. These
+        // offsets overlap the boxes and leave the glyphs themselves clear.
+        // Right-aligned: the two lines rarely have the same digit count, and
+        // ragging them left leaves the stack looking accidental.
+        let x = gaugeW + gap
+        let tw = topStr.size(withAttributes: topAttrs).width
+        let bw = botStr.size(withAttributes: botAttrs).width
+        topStr.draw(at: NSPoint(x: x + textW - tw, y: H - 11.5), withAttributes: topAttrs)
+        botStr.draw(at: NSPoint(x: x + textW - bw, y: -1.5), withAttributes: botAttrs)
         return true
     }
     // Not a template: the whole point is that the thermometer is coloured, and a
-    // template image is a monochrome mask. Text next to it stays labelColor, so
-    // that half still follows light and dark on its own.
+    // template image is a monochrome mask.
     img.isTemplate = false
     return img
-}
-
-/// Two short lines rather than one long one, so the item stays narrow. Digits
-/// are monospaced so it does not shuffle sideways as the numbers change.
-func statusTitle(temp: Double?, rpm: Double, critical: Double) -> NSAttributedString {
-    let para = NSMutableParagraphStyle()
-    para.lineSpacing = -2
-    para.alignment = .left
-    let font = NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .medium)
-
-    let out = NSMutableAttributedString()
-    let top = temp.map { String(format: "%.0f°", $0) } ?? "--°"
-    out.append(NSAttributedString(string: top + "\n", attributes: [
-        .font: font, .paragraphStyle: para,
-        .foregroundColor: temp.map { heatColor($0, critical: critical) } ?? .secondaryLabelColor,
-    ]))
-    out.append(NSAttributedString(string: rpm > 0 ? String(format: "%.0f", rpm) : "--", attributes: [
-        .font: font, .paragraphStyle: para, .foregroundColor: NSColor.labelColor,
-    ]))
-    return out
 }
 
 // MARK: - menu panel

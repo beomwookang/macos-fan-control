@@ -133,14 +133,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // under the button's own appearance: a dynamic colour resolved outside
         // it would be stale after a light/dark switch.
         let draw = {
-            self.item.button?.image = statusIcon(
+            // One image, text included. Handing the button a two-line title let
+            // it centre the block by its own reckoning, which pushed it up and
+            // clipped the temperature.
+            self.item.button?.image = statusMark(
                 temp: (st?.ok == true && st?.have_temp == true) ? st?.temp : nil,
                 rpm: st?.rpm ?? 0,
                 minRPM: st?.min_rpm ?? 1000, maxRPM: st?.max_rpm ?? 4900,
                 critical: st?.critical_temp ?? 98, running: running)
-            self.item.button?.attributedTitle = statusTitle(
-                temp: (st?.ok == true && st?.have_temp == true) ? st?.temp : nil,
-                rpm: st?.rpm ?? 0, critical: st?.critical_temp ?? 98)
+            self.item.button?.attributedTitle = NSAttributedString(string: "")
         }
         if let ea = item.button?.effectiveAppearance {
             ea.performAsCurrentDrawingAppearance(draw)
