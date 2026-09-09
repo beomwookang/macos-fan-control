@@ -1,0 +1,69 @@
+#!/bin/zsh
+#
+# Root-side actions for the menu bar app.
+#
+# sudoers grants this script NOPASSWD, so the verb list below is the security
+# boundary, not sudoers: every branch runs a fixed command and nothing the
+# caller supplies is ever expanded into a shell. Keep it that way.
+#
+set -u
+
+LABEL=com.local.fanctl
+PLIST=/Library/LaunchDaemons/$LABEL.plist
+FANCTL=/usr/local/bin/fanctl
+CONF=/usr/local/etc/fanctl.conf
+PAUSE=/usr/local/var/run/fanctl.paused
+
+die() { print -u2 -- "fanctl-admin: $1"; exit 1 }
+
+case "${1-}" in
+
+start)
+    [[ -f $PLIST ]] || die "not installed: $PLIST"
+    launchctl enable system/$LABEL 2>/dev/null
+    launchctl bootstrap system $PLIST 2>/dev/null
+    launchctl kickstart system/$LABEL 2>/dev/null
+    $FANCTL resume
+    ;;
+
+# Pause before bootout. Stopping the daemon on its own would leave whatever
+# RPM was last forced latched in the SMC - the exact failure fanctl exists to
+# fix - so the fan is handed back explicitly.
+stop)
+    $FANCTL pause  2>/dev/null
+    launchctl bootout system/$LABEL 2>/dev/null
+    $FANCTL auto
+    ;;
+
+pause)    $FANCTL pause ;;
+resume)   $FANCTL resume ;;
+reload)   launchctl kill -HUP system/$LABEL 2>/dev/null || true ;;
+boot-on)  launchctl enable  system/$LABEL ;;
+boot-off) launchctl disable system/$LABEL ;;
+
+# New config arrives on stdin. It is parsed before it is installed, so a curve
+# the daemon would reject never reaches the live file.
+setconf)
+    tmp=$(mktemp /usr/local/etc/.fanctl.conf.XXXXXX) || die "mktemp failed"
+    cat > $tmp
+    if ! $FANCTL -c $tmp status >/dev/null 2>&1; then
+        rm -f $tmp
+        die "config rejected by fanctl"
+    fi
+    chmod 644 $tmp && mv -f $tmp $CONF || die "could not install config"
+    launchctl kill -HUP system/$LABEL 2>/dev/null || true
+    ;;
+
+state)
+    launchctl print system/$LABEL >/dev/null 2>&1 && print "loaded=1" || print "loaded=0"
+    [[ -f $PAUSE ]] && print "paused=1" || print "paused=0"
+    [[ -f $PLIST ]] && print "installed=1" || print "installed=0"
+    if launchctl print-disabled system 2>/dev/null | grep -q "\"$LABEL\" => \(disabled\|true\)"; then
+        print "boot=0"
+    else
+        print "boot=1"
+    fi
+    ;;
+
+*)  die "usage: fanctl-admin start|stop|pause|resume|reload|boot-on|boot-off|setconf|state" ;;
+esac

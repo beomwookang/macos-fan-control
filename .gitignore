@@ -1,0 +1,10 @@
+# Build output. The .app must be built on the machine it runs on: the bundle is
+# ad-hoc signed, so a copy transferred from elsewhere picks up a quarantine flag
+# and macOS refuses to launch it.
+build/
+
+# Local backups
+*.bak
+src.bak-*/
+
+.DS_Store
